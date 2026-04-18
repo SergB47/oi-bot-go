@@ -1,0 +1,10 @@
+# Binaries
+oi_monitor
+*.exe
+# Database
+*.db
+*.db-journal
+# Environment
+.env
+# Go
+vendor/

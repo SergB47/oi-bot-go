@@ -462,3 +462,15 @@ func (ms *MomentumScheduler) SetMinScores(dayScore, nightScore float64) {
 	ms.dayMinScore = dayScore
 	ms.nightMinScore = nightScore
 }
+
+// CollectOnce performs a single collection cycle (for -once flag)
+// Overrides base Scheduler.CollectOnce to use momentum logic instead of legacy alerts
+func (ms *MomentumScheduler) CollectOnce() error {
+	return ms.collectAndProcess()
+}
+
+// CollectOnceAllMarkets performs a single collection from all markets (for -once -all flags)
+// Overrides base Scheduler.CollectOnceAllMarkets to use momentum logic
+func (ms *MomentumScheduler) CollectOnceAllMarkets() error {
+	return ms.collectAndProcess()
+}

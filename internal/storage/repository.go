@@ -3,6 +3,8 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"oi_bot_go/internal/analyzer"
+	"strings"
 	"time"
 )
 
@@ -306,4 +308,258 @@ func (r *Repository) GetFundingAtTime(coin, dex string, targetTime time.Time) (f
 	}
 
 	return funding, timestamp, nil
+}
+
+// GetOIHistoryForCoinAndDEX retrieves OI history for a specific coin and DEX within time range
+func (r *Repository) GetOIHistoryForCoinAndDEX(coin, dex string, from, to time.Time) ([]OIHistoryRecord, error) {
+	query := `SELECT id, coin, dex, market_type, open_interest, open_interest_usd, mark_price, funding, funding_apr, timestamp, created_at 
+		FROM oi_history 
+		WHERE coin = ? AND dex = ? AND timestamp BETWEEN ? AND ?
+		ORDER BY timestamp ASC`
+
+	rows, err := r.db.conn.Query(query, coin, dex, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OI history for coin and DEX: %w", err)
+	}
+	defer rows.Close()
+
+	var records []OIHistoryRecord
+	for rows.Next() {
+		var record OIHistoryRecord
+		err := rows.Scan(&record.ID, &record.Coin, &record.DEX, &record.MarketType,
+			&record.OpenInterest, &record.OpenInterestUSD, &record.MarkPrice, &record.Funding, &record.FundingAPR,
+			&record.Timestamp, &record.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan OI history: %w", err)
+		}
+		records = append(records, record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+
+	return records, nil
+}
+
+// SaveInstrumentStats saves or updates statistics
+func (r *Repository) SaveInstrumentStats(stats *analyzer.InstrumentStats) error {
+	query := `INSERT INTO instrument_stats 
+		(coin, dex, funding_mean_14d, funding_stddev_14d, funding_p50_14d,
+		 oi_mean_14d, oi_stddev_14d, price_mean_14d, price_volatility_14d, 
+		 last_calculated_at, data_points_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(coin, dex) DO UPDATE SET
+		funding_mean_14d = excluded.funding_mean_14d,
+		funding_stddev_14d = excluded.funding_stddev_14d,
+		funding_p50_14d = excluded.funding_p50_14d,
+		oi_mean_14d = excluded.oi_mean_14d,
+		oi_stddev_14d = excluded.oi_stddev_14d,
+		price_mean_14d = excluded.price_mean_14d,
+		price_volatility_14d = excluded.price_volatility_14d,
+		last_calculated_at = excluded.last_calculated_at,
+		data_points_count = excluded.data_points_count`
+
+	_, err := r.db.conn.Exec(query, stats.Coin, stats.DEX, stats.FundingMean,
+		stats.FundingStdDev, stats.FundingP50, stats.OIMean, stats.OIStdDev,
+		stats.PriceMean, stats.PriceVolatility, stats.LastCalculatedAt,
+		stats.DataPointsCount)
+	return err
+}
+
+// GetInstrumentStats retrieves stats for coin+dex
+func (r *Repository) GetInstrumentStats(coin, dex string) (*analyzer.InstrumentStats, error) {
+	query := `SELECT coin, dex, funding_mean_14d, funding_stddev_14d, funding_p50_14d,
+		oi_mean_14d, oi_stddev_14d, price_mean_14d, price_volatility_14d,
+		last_calculated_at, data_points_count
+		FROM instrument_stats WHERE coin = ? AND dex = ?`
+
+	row := r.db.conn.QueryRow(query, coin, dex)
+
+	stats := &analyzer.InstrumentStats{Coin: coin, DEX: dex}
+	err := row.Scan(&stats.Coin, &stats.DEX, &stats.FundingMean, &stats.FundingStdDev,
+		&stats.FundingP50, &stats.OIMean, &stats.OIStdDev, &stats.PriceMean,
+		&stats.PriceVolatility, &stats.LastCalculatedAt, &stats.DataPointsCount)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("stats not found")
+	}
+	return stats, err
+}
+
+// SyncStateRecord represents sync state
+type SyncStateRecord struct {
+	ID                int64
+	Coin              string
+	DEX               string
+	LastFundingValue  float64
+	LastFundingUpdate time.Time
+	FundingUpdateCount int
+	PrevFundingValue  float64
+	LastOIUSD         float64
+	LastOIUpdate      time.Time
+	LastMarkPrice     float64
+	LastOraclePrice   float64
+	Price30mAgo       float64
+	PriceDirection30m float64
+}
+
+// GetSyncState retrieves sync state
+func (r *Repository) GetSyncState(coin, dex string) (*SyncStateRecord, error) {
+	query := `SELECT id, coin, dex, last_funding_value, last_funding_update,
+		funding_update_count, prev_funding_value, last_oi_usd, last_oi_update,
+		last_mark_price, last_oracle_price, price_30m_ago, price_direction_30m
+		FROM instrument_sync_state WHERE coin = ? AND dex = ?`
+
+	row := r.db.conn.QueryRow(query, coin, dex)
+
+	var record SyncStateRecord
+	err := row.Scan(&record.ID, &record.Coin, &record.DEX, &record.LastFundingValue,
+		&record.LastFundingUpdate, &record.FundingUpdateCount, &record.PrevFundingValue,
+		&record.LastOIUSD, &record.LastOIUpdate, &record.LastMarkPrice,
+		&record.LastOraclePrice, &record.Price30mAgo, &record.PriceDirection30m)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("sync state not found")
+	}
+	return &record, err
+}
+
+// SaveSyncState saves sync state
+func (r *Repository) SaveSyncState(state *analyzer.SyncState) error {
+	query := `INSERT INTO instrument_sync_state 
+		(coin, dex, last_funding_value, last_funding_update, funding_update_count,
+		 prev_funding_value, last_oi_usd, last_oi_update, last_mark_price,
+		 last_oracle_price, price_30m_ago, price_direction_30m)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(coin, dex) DO UPDATE SET
+		last_funding_value = excluded.last_funding_value,
+		last_funding_update = excluded.last_funding_update,
+		funding_update_count = excluded.funding_update_count,
+		prev_funding_value = excluded.prev_funding_value,
+		last_oi_usd = excluded.last_oi_usd,
+		last_oi_update = excluded.last_oi_update,
+		last_mark_price = excluded.last_mark_price,
+		last_oracle_price = excluded.last_oracle_price,
+		price_30m_ago = excluded.price_30m_ago,
+		price_direction_30m = excluded.price_direction_30m`
+
+	_, err := r.db.conn.Exec(query, state.Coin, state.DEX, state.LastFundingValue,
+		state.LastFundingUpdate, state.FundingUpdateCount, state.PrevFundingValue,
+		state.LastOIUSD, state.LastOIUpdate, state.LastMarkPrice, state.LastOraclePrice,
+		state.Price30mAgo, state.PriceDirection30m)
+	return err
+}
+
+// SignalQueueRecord represents queued signal
+type SignalQueueRecord struct {
+	ID                int64
+	Coin              string
+	DEX               string
+	MarketType        string
+	SignalDirection   string
+	SignalConfidence  string
+	OIChange30m       float64
+	OIChange2h        float64
+	OIChange24h       float64
+	OIUSDCurrent      float64
+	FundingCurrent    float64
+	FundingChangeAbs  float64
+	FundingZScore     float64
+	FundingAPRCurrent float64
+	FundingFresh      bool
+	PriceChange30m    float64
+	PriceChange2h     float64
+	MarkPrice         float64
+	OraclePrice       float64
+	MarkOracleDelta   float64
+	CompositeScore    float64
+	DetectedAt        time.Time
+	DetectedInWindow  string
+	Processed         bool
+	SentInDigestAt    *time.Time
+}
+
+// SaveSignalToQueue saves signal
+func (r *Repository) SaveSignalToQueue(signal *SignalQueueRecord) error {
+	query := `INSERT INTO signal_queue 
+		(coin, dex, market_type, signal_direction, signal_confidence,
+		 oi_change_30m, oi_change_2h, oi_change_24h, oi_usd_current,
+		 funding_current, funding_change_abs, funding_zscore, funding_apr_current,
+		 funding_fresh, price_change_30m, price_change_2h, mark_price, oracle_price,
+		 mark_oracle_delta, composite_score, detected_in_window)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+	_, err := r.db.conn.Exec(query,
+		signal.Coin, signal.DEX, signal.MarketType, signal.SignalDirection,
+		signal.SignalConfidence, signal.OIChange30m, signal.OIChange2h,
+		signal.OIChange24h, signal.OIUSDCurrent, signal.FundingCurrent,
+		signal.FundingChangeAbs, signal.FundingZScore, signal.FundingAPRCurrent,
+		signal.FundingFresh, signal.PriceChange30m, signal.PriceChange2h,
+		signal.MarkPrice, signal.OraclePrice, signal.MarkOracleDelta,
+		signal.CompositeScore, signal.DetectedInWindow)
+	return err
+}
+
+// GetUnprocessedSignalsByDirection retrieves unprocessed signals by direction
+func (r *Repository) GetUnprocessedSignalsByDirection(direction string, limit int) ([]SignalQueueRecord, error) {
+	query := `SELECT id, coin, dex, market_type, signal_direction, signal_confidence,
+		oi_change_30m, oi_change_2h, oi_change_24h, oi_usd_current,
+		funding_current, funding_change_abs, funding_zscore, funding_apr_current,
+		funding_fresh, price_change_30m, price_change_2h, mark_price, oracle_price,
+		mark_oracle_delta, composite_score, detected_at, detected_in_window,
+		processed, sent_in_digest_at
+		FROM signal_queue 
+		WHERE processed = 0 AND signal_direction = ?
+		ORDER BY composite_score DESC LIMIT ?`
+
+	rows, err := r.db.conn.Query(query, direction, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var signals []SignalQueueRecord
+	for rows.Next() {
+		var s SignalQueueRecord
+		err := rows.Scan(&s.ID, &s.Coin, &s.DEX, &s.MarketType, &s.SignalDirection,
+			&s.SignalConfidence, &s.OIChange30m, &s.OIChange2h, &s.OIChange24h,
+			&s.OIUSDCurrent, &s.FundingCurrent, &s.FundingChangeAbs, &s.FundingZScore,
+			&s.FundingAPRCurrent, &s.FundingFresh, &s.PriceChange30m, &s.PriceChange2h,
+			&s.MarkPrice, &s.OraclePrice, &s.MarkOracleDelta, &s.CompositeScore,
+			&s.DetectedAt, &s.DetectedInWindow, &s.Processed, &s.SentInDigestAt)
+		if err != nil {
+			return nil, err
+		}
+		signals = append(signals, s)
+	}
+
+	return signals, rows.Err()
+}
+
+// MarkSignalsProcessed marks signals as processed
+func (r *Repository) MarkSignalsProcessed(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids)+1)
+	args[0] = time.Now()
+
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i+1] = id
+	}
+
+	query := fmt.Sprintf(`UPDATE signal_queue SET processed = 1, sent_in_digest_at = ?
+		WHERE id IN (%s)`, strings.Join(placeholders, ","))
+
+	_, err := r.db.conn.Exec(query, args...)
+	return err
+}
+
+// GetDB returns the raw database connection for custom queries
+func (r *Repository) GetDB() *sql.DB {
+	return r.db.conn
 }

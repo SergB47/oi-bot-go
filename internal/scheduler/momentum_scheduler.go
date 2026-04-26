@@ -286,13 +286,13 @@ func (ms *MomentumScheduler) processInstrument(
 		isSignificant = true
 	}
 
-	// Criteria 3: Strong momentum signal (score >= 70)
-	if score >= 70 {
+	// Criteria 3: Strong momentum signal (score >= 60)
+	if score >= 60 {
 		isSignificant = true
 	}
 
-	// Must have historical data AND minimum score of 50
-	if prevState == nil || score < 50 {
+	// Must have historical data AND minimum score of 60
+	if prevState == nil || score < 60 {
 		isSignificant = false
 	}
 
@@ -391,23 +391,23 @@ func (ms *MomentumScheduler) processInstrument(
 	return instantSignal, nil
 }
 
-// sendTopInstantAlerts sends top 5 signals by score in a single message
+// sendTopInstantAlerts sends top signals by score in a single message (max 5)
 func (ms *MomentumScheduler) sendTopInstantAlerts(signals []*storage.SignalQueueRecord) {
 	if len(signals) == 0 {
 		return
 	}
 
-	// Filter only signals with score >= 70
+	// Filter only signals with score >= 60
 	var significantSignals []*storage.SignalQueueRecord
 	for _, s := range signals {
-		if s.CompositeScore >= 70 {
+		if s.CompositeScore >= 60 {
 			significantSignals = append(significantSignals, s)
 		}
 	}
 
-	// If less than 5 significant signals, don't send (wait for better opportunities)
-	if len(significantSignals) < 5 {
-		log.Printf("Only %d significant instant signals (min 5 required), skipping batch alert", len(significantSignals))
+	// If no significant signals, don't send
+	if len(significantSignals) == 0 {
+		log.Printf("No significant instant signals (all below score 60), skipping batch alert")
 		return
 	}
 
@@ -416,7 +416,7 @@ func (ms *MomentumScheduler) sendTopInstantAlerts(signals []*storage.SignalQueue
 		return significantSignals[i].CompositeScore > significantSignals[j].CompositeScore
 	})
 
-	// Take top 5
+	// Take top 5 (or fewer if less available)
 	topCount := 5
 	if len(significantSignals) < topCount {
 		topCount = len(significantSignals)

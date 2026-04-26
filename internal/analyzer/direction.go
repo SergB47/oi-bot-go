@@ -20,9 +20,11 @@ func (dd *DirectionDetector) Detect(input DirectionInput) *DirectionResult {
 	if input.FundingFresh {
 		fundingDir := dd.detectByFunding(input.FundingCurrent, input.FundingPrevious)
 		if fundingDir == DirectionLong || fundingDir == DirectionShort {
+			// Confidence depends on magnitude of change, not just freshness
+			confidence := dd.calculateFundingConfidence(input)
 			return &DirectionResult{
 				Direction:  fundingDir,
-				Confidence: ConfidenceHigh,
+				Confidence: confidence,
 				Method:     "funding",
 			}
 		}
@@ -63,6 +65,19 @@ func (dd *DirectionDetector) Detect(input DirectionInput) *DirectionResult {
 		Confidence: ConfidenceLow,
 		Method:     "none",
 	}
+}
+
+// calculateFundingConfidence determines confidence based on funding change magnitude
+func (dd *DirectionDetector) calculateFundingConfidence(input DirectionInput) SignalConfidence {
+	// Large funding change = high confidence
+	fundingChange := math.Abs(input.FundingCurrent - input.FundingPrevious)
+	if fundingChange > 0.0005 { // > 0.05% change
+		return ConfidenceHigh
+	}
+	if fundingChange > 0.0001 { // > 0.01% change
+		return ConfidenceMedium
+	}
+	return ConfidenceLow
 }
 
 // detectByFunding determines direction based on funding rate

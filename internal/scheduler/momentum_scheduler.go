@@ -10,6 +10,7 @@ import (
 	"oi_bot_go/internal/hyperliquid"
 	"oi_bot_go/internal/storage"
 	"oi_bot_go/internal/telegram"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -97,13 +98,13 @@ func NewMomentumScheduler(
 
 	return &MomentumScheduler{
 		Scheduler:           base,
-		directionDetector: analyzer.NewDirectionDetector(),
+		directionDetector:   analyzer.NewDirectionDetector(),
 		statsCalc:           analyzer.NewStatsCalculator(historyProvider),
 		multiAnalyzer:       analyzer.NewMultiWindowAnalyzer(oiProvider, priceProvider),
 		scorer:              analyzer.NewSignalScorer(),
 		digestBuilder:       telegram.NewDigestBuilder(),
 		instantThreshold:    30.0,
-		digestInterval:    30 * time.Minute,
+		digestInterval:      30 * time.Minute,
 		nightStartHour:      22,
 		nightEndHour:        8,
 		nightMinScore:       85,
@@ -171,30 +172,42 @@ func (ms *MomentumScheduler) collectAndProcess() error {
 		}
 	}
 
+	// Collect all instant signals first, then send top 5
+	var instantSignals []*storage.SignalQueueRecord
+
 	// Process each instrument
 	for _, item := range allData.PerpData {
-		if err := ms.processInstrument(item, statsMap); err != nil {
+		signal, err := ms.processInstrument(item, statsMap)
+		if err != nil {
 			log.Printf("Failed to process %s/%s: %v", item.DEX, item.Coin, err)
 		}
+		if signal != nil {
+			instantSignals = append(instantSignals, signal)
+		}
+	}
+
+	// Send top 5 instant alerts sorted by score (only if score >= 70)
+	if len(instantSignals) > 0 {
+		ms.sendTopInstantAlerts(instantSignals)
 	}
 
 	return nil
 }
 
-// processInstrument analyzes a single instrument and triggers alerts/signals
+// processInstrument analyzes a single instrument and returns signal if it meets instant criteria
 func (ms *MomentumScheduler) processInstrument(
 	item hyperliquid.OpenInterestData,
 	statsMap map[string]*analyzer.InstrumentStats,
-) error {
+) (*storage.SignalQueueRecord, error) {
 	// Parse values
 	currentOI, err := strconv.ParseFloat(item.OpenInterest, 64)
 	if err != nil {
-		return fmt.Errorf("failed to parse OI: %w", err)
+		return nil, fmt.Errorf("failed to parse OI: %w", err)
 	}
 
 	markPrice, err := strconv.ParseFloat(item.MarkPrice, 64)
 	if err != nil {
-		return fmt.Errorf("failed to parse mark price: %w", err)
+		return nil, fmt.Errorf("failed to parse mark price: %w", err)
 	}
 
 	funding := 0.0
@@ -208,13 +221,7 @@ func (ms *MomentumScheduler) processInstrument(
 		dex = "native"
 	}
 
-	// Get stats for this instrument
-	stats := statsMap[item.Coin+"/"+dex]
-
-	// Get oracle price (using mark price as fallback since API may not provide it directly)
-	oraclePrice := markPrice
-
-	// Get previous sync state for funding freshness detection
+	// Get previous state for freshness detection
 	prevState, _ := ms.repository.GetSyncState(item.Coin, dex)
 
 	// Detect funding freshness by checking if funding changed
@@ -228,11 +235,11 @@ func (ms *MomentumScheduler) processInstrument(
 	// Multi-window analysis
 	analysis, err := ms.multiAnalyzer.Analyze(
 		item.Coin, dex, "perp",
-		oiUSD, funding, markPrice, oraclePrice,
-		stats,
+		oiUSD, funding, markPrice, markPrice, // oracle price not available, using mark
+		statsMap[item.Coin+"/"+dex],
 	)
 	if err != nil {
-		return fmt.Errorf("multi-window analysis failed: %w", err)
+		return nil, fmt.Errorf("multi-window analysis failed: %w", err)
 	}
 
 	// Set funding freshness and previous values
@@ -252,10 +259,10 @@ func (ms *MomentumScheduler) processInstrument(
 		FundingPrevious:       analysis.FundingPrevious,
 		FundingFresh:          fundingFresh,
 		MarkPrice:             markPrice,
-		OraclePrice:           oraclePrice,
+		OraclePrice:           markPrice,
 		HistoricalFundingMean: 0,
 	}
-	if stats != nil {
+	if stats := statsMap[item.Coin+"/"+dex]; stats != nil {
 		dirInput.HistoricalFundingMean = stats.FundingMean
 	}
 
@@ -264,23 +271,36 @@ func (ms *MomentumScheduler) processInstrument(
 	// Calculate composite score
 	score := ms.scorer.CalculateScore(analysis)
 
+	// Check if this instrument qualifies for instant alert
+	// STRICT criteria: only truly significant moves
+	isSignificant := false
+
+	// Criteria 1: Large OI change (>10% in any window)
+	if math.Abs(analysis.OIChange30m) >= 10.0 || math.Abs(analysis.OIChange2h) >= 10.0 || math.Abs(analysis.OIChange24h) >= 15.0 {
+		isSignificant = true
+	}
+
+	// Criteria 2: Extreme funding anomaly (Z-score > 2.5)
+	if math.Abs(analysis.FundingZScore) >= 2.5 {
+		isSignificant = true
+	}
+
+	// Criteria 3: Strong momentum signal (score >= 70)
+	if score >= 70 {
+		isSignificant = true
+	}
+
+	// Must have historical data
+	if prevState == nil {
+		isSignificant = false
+	}
+
+	var instantSignal *storage.SignalQueueRecord
+
 	// Check for instant alert (>30% moves)
-	// Only send if we have historical data (prevState exists) and meaningful changes
-	if analysis.ShouldAlertInstant(ms.instantThreshold) && prevState != nil {
-		// Validate we have actual historical data (not just zeros/rounding errors)
-		// Require at least 1% change in OI or price to consider it meaningful
-		hasMeaningfulOIChange := math.Abs(analysis.OIChange30m) >= 1.0 || math.Abs(analysis.OIChange2h) >= 1.0 || math.Abs(analysis.OIChange24h) >= 1.0
-		hasMeaningfulPriceChange := math.Abs(analysis.PriceChange30m) >= 0.5
-		
-		if !hasMeaningfulOIChange && !hasMeaningfulPriceChange {
-			log.Printf("Skipping instant alert for %s/%s: changes too small (OI: %.2f%%, Price: %.2f%%)", 
-				dex, item.Coin, analysis.OIChange30m, analysis.PriceChange30m)
-		} else if score < 50 {
-			// Also require minimum signal strength
-			log.Printf("Skipping instant alert for %s/%s: score too low (%.0f/100, min: 50)", 
-				dex, item.Coin, score)
-		} else if ms.shouldSendInstantAlert(item.Coin, dex) {
-			signal := &storage.SignalQueueRecord{
+	if analysis.ShouldAlertInstant(ms.instantThreshold) && isSignificant {
+		if ms.shouldSendInstantAlert(item.Coin, dex) {
+			instantSignal = &storage.SignalQueueRecord{
 				Coin:              item.Coin,
 				DEX:               dex,
 				MarketType:        "perp",
@@ -298,16 +318,15 @@ func (ms *MomentumScheduler) processInstrument(
 				PriceChange30m:    analysis.PriceChange30m,
 				PriceChange2h:     analysis.PriceChange2h,
 				MarkPrice:         markPrice,
-				OraclePrice:       oraclePrice,
+				OraclePrice:       markPrice,
 				MarkOracleDelta:   analysis.MarkOracleDelta,
 				CompositeScore:    score,
 				DetectedInWindow:  "instant",
 			}
-			ms.sendInstantAlert(signal)
 		}
 	}
 
-	// Check for periodic signal
+	// Check for periodic signal (queued for digest)
 	if analysis.ShouldAlertPeriodic() && ms.shouldQueueSignal(score) {
 		signal := &storage.SignalQueueRecord{
 			Coin:              item.Coin,
@@ -327,7 +346,7 @@ func (ms *MomentumScheduler) processInstrument(
 			PriceChange30m:    analysis.PriceChange30m,
 			PriceChange2h:     analysis.PriceChange2h,
 			MarkPrice:         markPrice,
-			OraclePrice:       oraclePrice,
+			OraclePrice:       markPrice,
 			MarkOracleDelta:   analysis.MarkOracleDelta,
 			CompositeScore:    score,
 			DetectedInWindow:  "30min",
@@ -347,23 +366,69 @@ func (ms *MomentumScheduler) processInstrument(
 		LastOIUSD:          oiUSD,
 		LastOIUpdate:       now,
 		LastMarkPrice:      markPrice,
-		LastOraclePrice:    oraclePrice,
-		Price30mAgo:        analysis.OIUSDPrevious,
+		LastOraclePrice:    markPrice,
+		Price30mAgo:        markPrice,
 		PriceDirection30m:  analysis.PriceChange30m,
 	}
 	if prevState != nil {
 		newState.FundingUpdateCount = prevState.FundingUpdateCount
-		newState.PrevFundingValue = prevState.LastFundingValue
 		if fundingFresh {
 			newState.FundingUpdateCount++
+			newState.PrevFundingValue = prevState.LastFundingValue
 		}
 	}
+
 	if err := ms.repository.SaveSyncState(newState); err != nil {
 		log.Printf("Failed to save sync state for %s/%s: %v", item.Coin, dex, err)
 	}
 
 	// Save to OI history
-	return ms.repository.SaveOIHistory(item.Coin, dex, "perp", currentOI, markPrice, funding)
+	if err := ms.repository.SaveOIHistory(item.Coin, dex, "perp", currentOI, markPrice, funding); err != nil {
+		return instantSignal, fmt.Errorf("failed to save OI history: %w", err)
+	}
+
+	return instantSignal, nil
+}
+
+// sendTopInstantAlerts sends top 5 signals by score in a single message
+func (ms *MomentumScheduler) sendTopInstantAlerts(signals []*storage.SignalQueueRecord) {
+	if len(signals) == 0 {
+		return
+	}
+
+	// Filter only signals with score >= 70
+	var significantSignals []*storage.SignalQueueRecord
+	for _, s := range signals {
+		if s.CompositeScore >= 70 {
+			significantSignals = append(significantSignals, s)
+		}
+	}
+
+	// If less than 5 significant signals, don't send (wait for better opportunities)
+	if len(significantSignals) < 5 {
+		log.Printf("Only %d significant instant signals (min 5 required), skipping batch alert", len(significantSignals))
+		return
+	}
+
+	// Sort by score descending
+	sort.Slice(significantSignals, func(i, j int) bool {
+		return significantSignals[i].CompositeScore > significantSignals[j].CompositeScore
+	})
+
+	// Take top 5
+	topCount := 5
+	if len(significantSignals) < topCount {
+		topCount = len(significantSignals)
+	}
+	topSignals := significantSignals[:topCount]
+
+	// Send combined alert
+	if ms.telegramBot != nil && ms.telegramBot.IsEnabled() {
+		msg := ms.digestBuilder.BuildInstantAlertBatch(topSignals)
+		if err := ms.telegramBot.SendAlert(msg); err != nil {
+			log.Printf("Failed to send instant alert batch: %v", err)
+		}
+	}
 }
 
 // shouldSendInstantAlert checks rate limiting (1 per 15min per instrument)
@@ -401,27 +466,13 @@ func (ms *MomentumScheduler) shouldQueueSignal(score float64) bool {
 	return score >= minScore
 }
 
-// sendInstantAlert sends an instant alert via Telegram
-func (ms *MomentumScheduler) sendInstantAlert(signal *storage.SignalQueueRecord) {
-	if ms.telegramBot == nil || !ms.telegramBot.IsEnabled() {
-		return
-	}
-
-	msg := ms.digestBuilder.BuildInstantAlert(*signal)
-	if err := ms.telegramBot.SendAlert(msg); err != nil {
-		log.Printf("Failed to send instant alert: %v", err)
-	} else {
-		log.Printf("Instant alert sent for %s/%s (score: %.0f)", signal.Coin, signal.DEX, signal.CompositeScore)
-	}
-}
-
 // sendDigest sends periodic digest of all queued signals
 func (ms *MomentumScheduler) sendDigest() error {
 	if ms.telegramBot == nil || !ms.telegramBot.IsEnabled() {
 		return nil
 	}
 
-	// Get unprocessed signals by direction
+	// Get signals by direction
 	longSignals, err := ms.repository.GetUnprocessedSignalsByDirection("long", 20)
 	if err != nil {
 		return fmt.Errorf("failed to get long signals: %w", err)
@@ -442,14 +493,10 @@ func (ms *MomentumScheduler) sendDigest() error {
 		return nil
 	}
 
-	// Count total instruments
 	dexes, _ := ms.repository.GetAllDEXs()
-	totalInstruments := len(dexes) * 20 // Approximate
 
-	// Build digest messages
-	messages := ms.digestBuilder.BuildDigest(longSignals, shortSignals, uncertainSignals, totalInstruments)
+	messages := ms.digestBuilder.BuildDigest(longSignals, shortSignals, uncertainSignals, len(dexes)*20)
 
-	// Collect all signal IDs for marking as processed
 	var allIDs []int64
 	for _, s := range longSignals {
 		allIDs = append(allIDs, s.ID)
@@ -461,21 +508,13 @@ func (ms *MomentumScheduler) sendDigest() error {
 		allIDs = append(allIDs, s.ID)
 	}
 
-	// Send messages
 	for _, msg := range messages {
 		if err := ms.telegramBot.SendAlert(msg); err != nil {
 			log.Printf("Failed to send digest: %v", err)
 		}
 	}
 
-	// Mark signals as processed
-	if err := ms.repository.MarkSignalsProcessed(allIDs); err != nil {
-		return fmt.Errorf("failed to mark signals processed: %w", err)
-	}
-
-	ms.lastDigestTime = time.Now()
-	log.Printf("Digest sent with %d signals", len(allIDs))
-	return nil
+	return ms.repository.MarkSignalsProcessed(allIDs)
 }
 
 // SetInstantThreshold sets the threshold for instant alerts
@@ -483,7 +522,7 @@ func (ms *MomentumScheduler) SetInstantThreshold(t float64) {
 	ms.instantThreshold = t
 }
 
-// SetDigestInterval sets the interval between digests
+// SetDigestInterval sets the digest interval
 func (ms *MomentumScheduler) SetDigestInterval(d time.Duration) {
 	ms.digestInterval = d
 }

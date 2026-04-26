@@ -267,3 +267,35 @@ func formatUSD(usd float64) string {
 	}
 	return fmt.Sprintf("$%.0fK", usd/1e3)
 }
+
+// BuildInstantAlertBatch creates a single alert message for top N signals
+func (db *DigestBuilder) BuildInstantAlertBatch(signals []*storage.SignalQueueRecord) string {
+	if len(signals) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("🚨 TOP MOMENTUM ALERTS | %s | %d signals\n\n", time.Now().Format("15:04 UTC"), len(signals)))
+
+	for i, s := range signals {
+		direction := "🟩 LONG"
+		if s.SignalDirection == "short" {
+			direction = "🟥 SHORT"
+		} else if s.SignalDirection == "uncertain" {
+			direction = "⚪ UNCERTAIN"
+		}
+
+		freshness := ""
+		if s.FundingFresh {
+			freshness = " 🆕"
+		}
+
+		b.WriteString(fmt.Sprintf("%d. %s/%s | %s | Score: %.0f\n", i+1, s.Coin, s.DEX, direction, s.CompositeScore))
+		b.WriteString(fmt.Sprintf("   OI: %s 30m | %s 2h | Funding: %.0f%% APR%s\n",
+			formatChange(s.OIChange30m), formatChange(s.OIChange2h), s.FundingAPRCurrent, freshness))
+		b.WriteString(fmt.Sprintf("   %s | Price %s | Z: %.1f\n\n",
+			formatUSD(s.OIUSDCurrent), formatChange(s.PriceChange30m), s.FundingZScore))
+	}
+
+	return b.String()
+}

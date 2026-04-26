@@ -94,42 +94,6 @@ func (db *DigestBuilder) BuildDigest(longSignals, shortSignals, uncertainSignals
 	return messages
 }
 
-// BuildInstantAlert builds an instant alert for >30% moves
-func (db *DigestBuilder) BuildInstantAlert(s storage.SignalQueueRecord) string {
-	direction := "🟩 LONG"
-	if s.SignalDirection == "short" {
-		direction = "🟥 SHORT"
-	}
-
-	freshness := ""
-	if s.FundingFresh {
-		freshness = " 🆕"
-	}
-
-	return fmt.Sprintf(
-		"🚨 CRITICAL MOMENTUM | %s\n\n"+
-		"🔥 %s/%s: %s impulse accelerating\n"+
-		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"+
-		"OI: %s in 30min | %s\n"+
-		"Funding: %.0f%% APR%s | Z-score: %.1f\n"+
-		"Price: %s (mark vs 30m ago)\n\n"+
-		"Classification: %s | %s CONFIDENCE\n\n"+
-		"Context:\n"+
-		"• 30m: %s | 2h: %s | 24h: %s\n"+
-		"• Mark/Oracle: %.2f%%\n"+
-		"• Signal strength: %.0f/100\n",
-		time.Now().Format("15:04 UTC"),
-		s.Coin, s.DEX, direction,
-		formatChange(s.OIChange30m), formatUSD(s.OIUSDCurrent),
-		s.FundingAPRCurrent, freshness, s.FundingZScore,
-		formatChange(s.PriceChange30m),
-		direction, strings.ToUpper(s.SignalConfidence),
-		formatChange(s.OIChange30m), formatChange(s.OIChange2h), formatChange(s.OIChange24h),
-		s.MarkOracleDelta,
-		s.CompositeScore,
-	)
-}
-
 // formatDirectionSection formats a section of signals grouped by confidence
 func (db *DigestBuilder) formatDirectionSection(title string, signals []storage.SignalQueueRecord) string {
 	var b strings.Builder

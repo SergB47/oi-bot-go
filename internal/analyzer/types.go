@@ -1,5 +1,7 @@
 package analyzer
 
+import "time"
+
 // Direction represents trading direction
 type Direction string
 
@@ -36,4 +38,20 @@ type DirectionInput struct {
 	FundingFresh          bool
 	MarkPrice             float64
 	OraclePrice           float64
+}
+
+// SyncState represents the synchronization state for an instrument
+type SyncState struct {
+	Coin                string
+	DEX                 string
+	LastFundingValue    float64
+	LastFundingUpdate   time.Time
+	FundingUpdateCount  int
+	PrevFundingValue    float64
+	LastOIUSD           float64
+	LastOIUpdate        time.Time
+	LastMarkPrice       float64
+	LastOraclePrice     float64
+	Price30mAgo         float64
+	PriceDirection30m   float64
 }

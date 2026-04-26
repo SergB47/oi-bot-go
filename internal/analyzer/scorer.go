@@ -1,6 +1,9 @@
 package analyzer
 
-import "math"
+import (
+	"log"
+	"math"
+)
 
 // SignalScorer calculates composite score for momentum signals
 type SignalScorer struct{}
@@ -12,6 +15,18 @@ func NewSignalScorer() *SignalScorer {
 
 // CalculateScore computes momentum-focused score
 func (ss *SignalScorer) CalculateScore(analysis *MultiWindowAnalysis) float64 {
+	if analysis == nil {
+		return 0
+	}
+
+	// Validate inputs to prevent NaN/Inf propagation
+	if math.IsNaN(analysis.OIChange30m) || math.IsInf(analysis.OIChange30m, 0) ||
+		math.IsNaN(analysis.OIChange2h) || math.IsInf(analysis.OIChange2h, 0) ||
+		math.IsNaN(analysis.FundingZScore) || math.IsInf(analysis.FundingZScore, 0) {
+		log.Printf("Invalid analysis values detected (NaN/Inf)")
+		return 0
+	}
+
 	// Speed component (immediate impulse) - max 35 points
 	oi30mComponent := math.Min(math.Abs(analysis.OIChange30m)*2, 35)
 

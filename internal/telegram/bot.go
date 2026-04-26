@@ -3,15 +3,53 @@ package telegram
 import (
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// RateLimiter implements token bucket rate limiting
+type RateLimiter struct {
+	tokens   chan struct{}
+	interval time.Duration
+}
+
+// NewRateLimiter creates a new rate limiter with specified rate
+func NewRateLimiter(rate int, per time.Duration) *RateLimiter {
+	rl := &RateLimiter{
+		tokens:   make(chan struct{}, rate),
+		interval: per,
+	}
+	for i := 0; i < rate; i++ {
+		rl.tokens <- struct{}{}
+	}
+	go rl.refill(rate, per)
+	return rl
+}
+
+func (rl *RateLimiter) refill(rate int, per time.Duration) {
+	ticker := time.NewTicker(per / time.Duration(rate))
+	defer ticker.Stop()
+	for range ticker.C {
+		select {
+		case rl.tokens <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Wait blocks until a token is available
+func (rl *RateLimiter) Wait() {
+	<-rl.tokens
+}
+
 // Bot represents a Telegram bot for sending alerts
 type Bot struct {
-	api       *tgbotapi.BotAPI
-	chatID    int64
-	enabled  bool
+	api         *tgbotapi.BotAPI
+	chatID      int64
+	enabled     bool
+	rateLimiter *RateLimiter
 }
 
 // NewBot creates a new Telegram bot instance
@@ -29,9 +67,10 @@ func NewBot(token string, chatID int64) (*Bot, error) {
 	log.Printf("Telegram bot authorized: @%s", api.Self.UserName)
 
 	return &Bot{
-		api:     api,
-		chatID:  chatID,
-		enabled: true,
+		api:         api,
+		chatID:      chatID,
+		enabled:     true,
+		rateLimiter: NewRateLimiter(20, time.Minute), // 20 msg/min
 	}, nil
 }
 
@@ -73,14 +112,35 @@ func (b *Bot) SendAlert(message string) error {
 }
 
 func (b *Bot) sendMessage(text string) error {
+	if !b.enabled {
+		return nil
+	}
+
+	b.rateLimiter.Wait() // Respect rate limit
+
 	msg := tgbotapi.NewMessage(b.chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdown
 
-	_, err := b.api.Send(msg)
-	if err != nil {
+	// Retry with exponential backoff
+	var err error
+	for i := 0; i < 3; i++ {
+		_, err = b.api.Send(msg)
+		if err == nil {
+			return nil
+		}
+
+		// Check if rate limited (429 error)
+		if strings.Contains(err.Error(), "429") ||
+			strings.Contains(err.Error(), "Too Many Requests") {
+			backoff := time.Duration(i+1) * 2 * time.Second
+			time.Sleep(backoff)
+			continue
+		}
+
 		return fmt.Errorf("failed to send message: %w", err)
 	}
-	return nil
+
+	return fmt.Errorf("failed to send message after retries: %w", err)
 }
 
 // IsEnabled returns whether the bot is enabled

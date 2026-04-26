@@ -1,6 +1,8 @@
 package analyzer
 
 import (
+	"fmt"
+	"log"
 	"math"
 	"time"
 )
@@ -67,18 +69,27 @@ func (mwa *MultiWindowAnalyzer) Analyze(
 	now := time.Now()
 
 	// Get historical OI snapshots
-	var oi30mAgo, oi2hAgo, oi24hAgo float64
-	if mwa.oiProvider != nil {
-		oi30mAgo, _ = mwa.oiProvider(coin, dex, now.Add(-30*time.Minute))
-		oi2hAgo, _ = mwa.oiProvider(coin, dex, now.Add(-2*time.Hour))
-		oi24hAgo, _ = mwa.oiProvider(coin, dex, now.Add(-24*time.Hour))
+	oi30mAgo, err := mwa.getOIAtTime(coin, dex, now.Add(-30*time.Minute))
+	if err != nil {
+		log.Printf("Failed to get 30m OI for %s/%s: %v", coin, dex, err)
+	}
+	oi2hAgo, err := mwa.getOIAtTime(coin, dex, now.Add(-2*time.Hour))
+	if err != nil {
+		log.Printf("Failed to get 2h OI for %s/%s: %v", coin, dex, err)
+	}
+	oi24hAgo, err := mwa.getOIAtTime(coin, dex, now.Add(-24*time.Hour))
+	if err != nil {
+		log.Printf("Failed to get 24h OI for %s/%s: %v", coin, dex, err)
 	}
 
 	// Get historical price snapshots
-	var price30mAgo, price2hAgo float64
-	if mwa.priceProvider != nil {
-		price30mAgo, _ = mwa.priceProvider(coin, dex, now.Add(-30*time.Minute))
-		price2hAgo, _ = mwa.priceProvider(coin, dex, now.Add(-2*time.Hour))
+	price30mAgo, err := mwa.getPriceAtTime(coin, dex, now.Add(-30*time.Minute))
+	if err != nil {
+		log.Printf("Failed to get 30m price for %s/%s: %v", coin, dex, err)
+	}
+	price2hAgo, err := mwa.getPriceAtTime(coin, dex, now.Add(-2*time.Hour))
+	if err != nil {
+		log.Printf("Failed to get 2h price for %s/%s: %v", coin, dex, err)
 	}
 
 	analysis := &MultiWindowAnalysis{
@@ -141,6 +152,36 @@ func (mwa *MultiWindowAnalysis) ShouldAlertPeriodic() bool {
 		math.Abs(mwa.OIChange24h) > 30.0 ||
 		math.Abs(mwa.FundingZScore) > 2.0 ||
 		(mwa.FundingFresh && math.Abs(mwa.FundingChangePercent) > 30.0)
+}
+
+// getOIAtTime safely retrieves OI at a specific time, returning -1 as sentinel for errors
+func (mwa *MultiWindowAnalyzer) getOIAtTime(coin, dex string, targetTime time.Time) (float64, error) {
+	if mwa.oiProvider == nil {
+		return 0, nil
+	}
+	oi, err := mwa.oiProvider(coin, dex, targetTime)
+	if err != nil {
+		return -1, err // Use -1 as sentinel for "unknown"
+	}
+	if oi < 0 {
+		return -1, fmt.Errorf("negative OI value: %f", oi)
+	}
+	return oi, nil
+}
+
+// getPriceAtTime safely retrieves price at a specific time, returning -1 as sentinel for errors
+func (mwa *MultiWindowAnalyzer) getPriceAtTime(coin, dex string, targetTime time.Time) (float64, error) {
+	if mwa.priceProvider == nil {
+		return 0, nil
+	}
+	price, err := mwa.priceProvider(coin, dex, targetTime)
+	if err != nil {
+		return -1, err // Use -1 as sentinel for "unknown"
+	}
+	if price < 0 {
+		return -1, fmt.Errorf("negative price value: %f", price)
+	}
+	return price, nil
 }
 
 // calculateChangePercent calculates percentage change between two values

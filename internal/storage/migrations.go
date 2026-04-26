@@ -1,17 +1,53 @@
 package storage
 
 import (
+	"database/sql"
 	"fmt"
 )
 
-// migrate runs all database migrations
+// ensureMigrationsTable creates the schema_migrations table if it doesn't exist
+func (db *DB) ensureMigrationsTable() error {
+	query := `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`
+	_, err := db.conn.Exec(query)
+	return err
+}
+
+// isMigrationApplied checks if a migration version has already been applied
+func (db *DB) isMigrationApplied(version int) (bool, error) {
+	var exists bool
+	err := db.conn.QueryRow("SELECT 1 FROM schema_migrations WHERE version = ?", version).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// recordMigration records that a migration has been applied
+func (db *DB) recordMigration(tx *sql.Tx, version int) error {
+	_, err := tx.Exec("INSERT INTO schema_migrations (version) VALUES (?)", version)
+	return err
+}
+
+// migrate runs all database migrations with transaction support
 func (db *DB) migrate() error {
+	if err := db.ensureMigrationsTable(); err != nil {
+		return fmt.Errorf("failed to create migrations table: %w", err)
+	}
+
 	migrations := []struct {
-		name string
-		sql  string
+		version int
+		name    string
+		sql     string
 	}{
 		{
-			name: "create_oi_history_table_v3",
+			version: 1,
+			name:    "create_oi_history_table_v3",
 			sql: `CREATE TABLE IF NOT EXISTS oi_history (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -27,7 +63,8 @@ func (db *DB) migrate() error {
 			);`,
 		},
 		{
-			name: "create_oi_history_indexes",
+			version: 2,
+			name:    "create_oi_history_indexes",
 			sql: `CREATE INDEX IF NOT EXISTS idx_oi_history_coin ON oi_history(coin);
 			CREATE INDEX IF NOT EXISTS idx_oi_history_dex ON oi_history(dex);
 			CREATE INDEX IF NOT EXISTS idx_oi_history_timestamp ON oi_history(timestamp);
@@ -35,7 +72,8 @@ func (db *DB) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_oi_history_dex_coin ON oi_history(dex, coin, timestamp DESC);`,
 		},
 		{
-			name: "create_alerts_table_v2",
+			version: 3,
+			name:    "create_alerts_table_v2",
 			sql: `CREATE TABLE IF NOT EXISTS alerts (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -50,7 +88,8 @@ func (db *DB) migrate() error {
 			);`,
 		},
 		{
-			name: "create_alerts_indexes",
+			version: 4,
+			name:    "create_alerts_indexes",
 			sql: `CREATE INDEX IF NOT EXISTS idx_alerts_coin ON alerts(coin);
 			CREATE INDEX IF NOT EXISTS idx_alerts_dex ON alerts(dex);
 			CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp);
@@ -58,11 +97,13 @@ func (db *DB) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_alerts_dex_coin ON alerts(dex, coin, timestamp DESC);`,
 		},
 		{
-			name: "add_funding_apr_column",
-			sql: `ALTER TABLE oi_history ADD COLUMN funding_apr NUMERIC NOT NULL DEFAULT 0;`,
+			version: 5,
+			name:    "add_funding_apr_column",
+			sql:     `ALTER TABLE oi_history ADD COLUMN funding_apr NUMERIC NOT NULL DEFAULT 0;`,
 		},
 		{
-			name: "create_funding_alerts_table",
+			version: 6,
+			name:    "create_funding_alerts_table",
 			sql: `CREATE TABLE IF NOT EXISTS funding_alerts (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -78,19 +119,22 @@ func (db *DB) migrate() error {
 			);`,
 		},
 		{
-			name: "create_funding_alerts_indexes",
+			version: 7,
+			name:    "create_funding_alerts_indexes",
 			sql: `CREATE INDEX IF NOT EXISTS idx_funding_alerts_coin ON funding_alerts(coin);
 			CREATE INDEX IF NOT EXISTS idx_funding_alerts_dex ON funding_alerts(dex);
 			CREATE INDEX IF NOT EXISTS idx_funding_alerts_timestamp ON funding_alerts(timestamp);
 			CREATE INDEX IF NOT EXISTS idx_funding_alerts_period ON funding_alerts(period_type);`,
 		},
 		{
-			name: "add_open_interest_usd_column",
-			sql: `ALTER TABLE oi_history ADD COLUMN open_interest_usd REAL NOT NULL DEFAULT 0;`,
+			version: 8,
+			name:    "add_open_interest_usd_column",
+			sql:     `ALTER TABLE oi_history ADD COLUMN open_interest_usd REAL NOT NULL DEFAULT 0;`,
 		},
 		// Phase 1: Smart Alerting System - Database Foundation
 		{
-			name: "create_instrument_stats_table_v4",
+			version: 9,
+			name:    "create_instrument_stats_table_v4",
 			sql: `CREATE TABLE IF NOT EXISTS instrument_stats (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -114,7 +158,8 @@ func (db *DB) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_instrument_stats_last_calc ON instrument_stats(last_calculated_at);`,
 		},
 		{
-			name: "create_instrument_sync_state_table_v5",
+			version: 10,
+			name:    "create_instrument_sync_state_table_v5",
 			sql: `CREATE TABLE IF NOT EXISTS instrument_sync_state (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -134,7 +179,8 @@ func (db *DB) migrate() error {
 			CREATE INDEX IF NOT EXISTS idx_sync_state_coin_dex ON instrument_sync_state(coin, dex);`,
 		},
 		{
-			name: "create_signal_queue_table_v6",
+			version: 11,
+			name:    "create_signal_queue_table_v6",
 			sql: `CREATE TABLE IF NOT EXISTS signal_queue (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				coin TEXT NOT NULL,
@@ -169,14 +215,45 @@ func (db *DB) migrate() error {
 	}
 
 	for _, migration := range migrations {
-		if _, err := db.conn.Exec(migration.sql); err != nil {
-			// Ignore errors for duplicate columns
+		// Check if already applied
+		applied, err := db.isMigrationApplied(migration.version)
+		if err != nil {
+			return fmt.Errorf("failed to check migration %d status: %w", migration.version, err)
+		}
+		if applied {
+			continue // Skip already applied migrations
+		}
+
+		// Run in transaction
+		tx, err := db.conn.Begin()
+		if err != nil {
+			return fmt.Errorf("migration %d (%s): failed to begin transaction: %w", migration.version, migration.name, err)
+		}
+
+		if _, err := tx.Exec(migration.sql); err != nil {
+			tx.Rollback()
+			// Ignore errors for duplicate columns (SQLite doesn't support IF NOT EXISTS on ALTER TABLE)
 			if migration.name == "add_funding_apr_column" ||
 				migration.name == "add_open_interest_usd_column" ||
 				migration.name == "change_funding_to_text" {
-				continue // Skip if column already exists or type change not supported
+				// Record as applied outside of the failed transaction
+				_, err := db.conn.Exec("INSERT INTO schema_migrations (version) VALUES (?)", migration.version)
+				if err != nil {
+					return fmt.Errorf("migration %d (%s): failed to record after duplicate column: %w", migration.version, migration.name, err)
+				}
+				continue
 			}
-			return fmt.Errorf("migration %s failed: %w", migration.name, err)
+			return fmt.Errorf("migration %d (%s) failed: %w", migration.version, migration.name, err)
+		}
+
+		// Record migration
+		if err := db.recordMigration(tx, migration.version); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migration %d (%s): failed to record: %w", migration.version, migration.name, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migration %d (%s): failed to commit: %w", migration.version, migration.name, err)
 		}
 	}
 

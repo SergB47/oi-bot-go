@@ -537,26 +537,43 @@ func (r *Repository) GetUnprocessedSignalsByDirection(direction string, limit in
 	return signals, rows.Err()
 }
 
-// MarkSignalsProcessed marks signals as processed
+// MarkSignalsProcessed marks signals as processed with batching for safety
 func (r *Repository) MarkSignalsProcessed(ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
 
-	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids)+1)
-	args[0] = time.Now()
+	const batchSize = 500 // SQLite limit safety
+	now := time.Now()
 
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i+1] = id
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, len(batch)+1)
+		args[0] = now
+
+		for j, id := range batch {
+			if id <= 0 {
+				return fmt.Errorf("invalid signal ID: %d", id)
+			}
+			placeholders[j] = "?"
+			args[j+1] = id
+		}
+
+		query := fmt.Sprintf(`UPDATE signal_queue SET processed = 1, sent_in_digest_at = ?
+			WHERE id IN (%s)`, strings.Join(placeholders, ","))
+
+		_, err := r.db.conn.Exec(query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to mark batch %d-%d as processed: %w", i, end, err)
+		}
 	}
-
-	query := fmt.Sprintf(`UPDATE signal_queue SET processed = 1, sent_in_digest_at = ?
-		WHERE id IN (%s)`, strings.Join(placeholders, ","))
-
-	_, err := r.db.conn.Exec(query, args...)
-	return err
+	return nil
 }
 
 // GetDB returns the raw database connection for custom queries

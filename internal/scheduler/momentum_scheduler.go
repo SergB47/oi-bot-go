@@ -11,6 +11,7 @@ import (
 	"oi_bot_go/internal/storage"
 	"oi_bot_go/internal/telegram"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -33,8 +34,9 @@ type MomentumScheduler struct {
 	dayMinScore      float64
 
 	// Runtime state
-	lastDigestTime      time.Time
-	instantAlertHistory map[string]time.Time
+	lastDigestTime          time.Time
+	instantAlertHistory     map[string]time.Time
+	instantAlertHistoryMu   sync.RWMutex
 }
 
 // NewMomentumScheduler creates a new momentum-based scheduler
@@ -354,10 +356,21 @@ func (ms *MomentumScheduler) processInstrument(
 // shouldSendInstantAlert checks rate limiting (1 per 15min per instrument)
 func (ms *MomentumScheduler) shouldSendInstantAlert(coin, dex string) bool {
 	key := coin + "/" + dex
+
+	ms.instantAlertHistoryMu.RLock()
 	lastAlert, exists := ms.instantAlertHistory[key]
+	ms.instantAlertHistoryMu.RUnlock()
+
 	if !exists || time.Since(lastAlert) > 15*time.Minute {
-		ms.instantAlertHistory[key] = time.Now()
-		return true
+		ms.instantAlertHistoryMu.Lock()
+		defer ms.instantAlertHistoryMu.Unlock()
+
+		// Double-check after acquiring write lock
+		lastAlert, exists = ms.instantAlertHistory[key]
+		if !exists || time.Since(lastAlert) > 15*time.Minute {
+			ms.instantAlertHistory[key] = time.Now()
+			return true
+		}
 	}
 	return false
 }
@@ -396,9 +409,20 @@ func (ms *MomentumScheduler) sendDigest() error {
 	}
 
 	// Get unprocessed signals by direction
-	longSignals, _ := ms.repository.GetUnprocessedSignalsByDirection("long", 20)
-	shortSignals, _ := ms.repository.GetUnprocessedSignalsByDirection("short", 20)
-	uncertainSignals, _ := ms.repository.GetUnprocessedSignalsByDirection("uncertain", 10)
+	longSignals, err := ms.repository.GetUnprocessedSignalsByDirection("long", 20)
+	if err != nil {
+		return fmt.Errorf("failed to get long signals: %w", err)
+	}
+
+	shortSignals, err := ms.repository.GetUnprocessedSignalsByDirection("short", 20)
+	if err != nil {
+		return fmt.Errorf("failed to get short signals: %w", err)
+	}
+
+	uncertainSignals, err := ms.repository.GetUnprocessedSignalsByDirection("uncertain", 10)
+	if err != nil {
+		return fmt.Errorf("failed to get uncertain signals: %w", err)
+	}
 
 	if len(longSignals) == 0 && len(shortSignals) == 0 && len(uncertainSignals) == 0 {
 		log.Println("No signals for digest")

@@ -13,6 +13,14 @@ import (
 	"oi_bot_go/internal/telegram"
 )
 
+// SchedulerInterface defines the common interface for all schedulers
+type SchedulerInterface interface {
+	Start(ctx context.Context) error
+	SetTelegramBot(bot *telegram.Bot)
+	CollectOnce() error
+	CollectOnceAllMarkets() error
+}
+
 // Scheduler handles periodic data collection and alerting
 type Scheduler struct {
 	client              *hyperliquid.Client

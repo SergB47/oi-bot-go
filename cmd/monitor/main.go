@@ -22,9 +22,13 @@ import (
 const (
 	defaultDBPath          = "oi_monitor.db"
 	defaultInterval        = 5 * time.Minute
-	defaultAlertThreshold  = 20.0 // OI change threshold
-	defaultFunding5Min     = 20.0 // Funding change 5 min threshold
-	defaultFunding1Hour    = 10.0 // Funding change 1 hour threshold
+	defaultAlertThreshold  = 20.0  // OI change threshold
+	defaultFunding5Min     = 20.0  // Funding change 5 min threshold
+	defaultFunding1Hour    = 10.0  // Funding change 1 hour threshold
+	defaultInstantThreshold = 30.0 // Instant alert threshold for momentum strategy
+	defaultDigestInterval  = 30 * time.Minute
+	defaultNightStart      = 22
+	defaultNightEnd        = 8
 )
 
 func main() {
@@ -46,6 +50,14 @@ func main() {
 	showAlerts := flag.Bool("alerts", false, "Show recent OI alerts")
 	showFundingAlerts := flag.Bool("funding-alerts", false, "Show recent funding alerts")
 	listDEXs := flag.Bool("list-dexes", false, "List all DEXs in database")
+
+	// Smart alerting system flags
+	smartAlerts := flag.Bool("smart-alerts", true, "Enable momentum-based alerting")
+	instantThreshold := flag.Float64("instant-threshold", defaultInstantThreshold, "Threshold for instant alerts (%)")
+	digestInterval := flag.Duration("digest-interval", defaultDigestInterval, "Digest interval")
+	nightStart := flag.Int("night-start", defaultNightStart, "Night mode start hour")
+	nightEnd := flag.Int("night-end", defaultNightEnd, "Night mode end hour")
+
 	flag.Parse()
 
 	// Initialize database
@@ -111,9 +123,20 @@ func main() {
 	// Determine collection mode
 	collectAll := *allMarkets && !*nativeOnly
 
-	// Initialize scheduler
-	sch := scheduler.NewSchedulerWithOptions(client, repository, *interval, *alertThreshold, collectAll)
-	sch.SetTelegramBot(tgBot)
+	// Initialize scheduler (smart alerts or legacy)
+	var sch scheduler.SchedulerInterface
+	if *smartAlerts {
+		log.Println("Using MomentumScheduler (smart alerting enabled)")
+		momentumSch := scheduler.NewMomentumScheduler(client, repository, *interval, tgBot)
+		momentumSch.SetInstantThreshold(*instantThreshold)
+		momentumSch.SetDigestInterval(*digestInterval)
+		momentumSch.SetNightHours(*nightStart, *nightEnd)
+		sch = momentumSch
+	} else {
+		log.Println("Using legacy Scheduler (smart alerting disabled)")
+		sch = scheduler.NewSchedulerWithOptions(client, repository, *interval, *alertThreshold, collectAll)
+		sch.SetTelegramBot(tgBot)
+	}
 
 	// One-shot mode
 	if *oneShot {
@@ -136,7 +159,11 @@ func main() {
 	if !collectAll {
 		mode = "native DEX only"
 	}
-	log.Printf("Starting OI Monitor (interval: %v, mode: %s)", *interval, mode)
+	schedulerMode := "legacy"
+	if *smartAlerts {
+		schedulerMode = "momentum"
+	}
+	log.Printf("Starting OI Monitor (interval: %v, mode: %s, scheduler: %s)", *interval, mode, schedulerMode)
 	log.Println("Press Ctrl+C to stop")
 
 	ctx, cancel := context.WithCancel(context.Background())

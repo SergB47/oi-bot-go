@@ -265,8 +265,13 @@ func (ms *MomentumScheduler) processInstrument(
 	score := ms.scorer.CalculateScore(analysis)
 
 	// Check for instant alert (>30% moves)
-	if analysis.ShouldAlertInstant(ms.instantThreshold) {
-		if ms.shouldSendInstantAlert(item.Coin, dex) {
+	// Only send if we have historical data (prevState exists) and meaningful changes
+	if analysis.ShouldAlertInstant(ms.instantThreshold) && prevState != nil {
+		// Validate we have actual historical data, not just zeros
+		hasHistoricalData := math.Abs(analysis.OIChange30m) > 0.1 || math.Abs(analysis.OIChange2h) > 0.1
+		if !hasHistoricalData {
+			log.Printf("Skipping instant alert for %s/%s: insufficient historical data (OI changes are zero)", dex, item.Coin)
+		} else if ms.shouldSendInstantAlert(item.Coin, dex) {
 			signal := &storage.SignalQueueRecord{
 				Coin:              item.Coin,
 				DEX:               dex,

@@ -280,8 +280,9 @@ func (ms *MomentumScheduler) processInstrument(
 		isSignificant = true
 	}
 
-	// Criteria 2: Extreme funding anomaly (Z-score > 2.5)
-	if math.Abs(analysis.FundingZScore) >= 2.5 {
+	// Criteria 2: Extreme funding anomaly (Z-score > 3.0) AND meaningful OI
+	// Require both Z-score AND some OI change to avoid noise
+	if math.Abs(analysis.FundingZScore) >= 3.0 && (math.Abs(analysis.OIChange30m) >= 5.0 || math.Abs(analysis.OIChange2h) >= 5.0) {
 		isSignificant = true
 	}
 
@@ -290,8 +291,8 @@ func (ms *MomentumScheduler) processInstrument(
 		isSignificant = true
 	}
 
-	// Must have historical data
-	if prevState == nil {
+	// Must have historical data AND minimum score of 50
+	if prevState == nil || score < 50 {
 		isSignificant = false
 	}
 
